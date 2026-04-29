@@ -1,0 +1,33 @@
+# JUCE — vendored as a sibling clone, not committed.
+JUCE/
+
+# CMake / build outputs
+build/
+build_nmake/
+build_*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Object / binary stragglers
+*.o
+*.obj
+*.exe
+*.dll
+*.dylib
+*.so
+*.pdb
+*.ilk
