@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include <juce_events/juce_events.h>
+
 namespace phobos {
 
 namespace {
@@ -163,7 +165,7 @@ bool ControlServer::readFrame(juce::StreamingSocket& sock, std::vector<char>& bu
 
 bool ControlServer::writeFrame(juce::StreamingSocket& sock, const juce::String& body)
 {
-    const int len = body.getNumBytesAsUTF8();
+    const int len = static_cast<int>(body.getNumBytesAsUTF8());
     char header[4];
     writeBE32(header, static_cast<uint32_t>(len));
 
@@ -203,7 +205,28 @@ void ControlServer::dispatchRequest(const juce::var& request, juce::String& resp
 
     juce::String  errorOut;
     const auto    args   = obj->getProperty("args");
-    const juce::var result = it->second(args, errorOut);
+
+    // All op handlers run on the JUCE message thread. Most ops mutate
+    // DAW graph state, plugin instances, or window manager state — none
+    // of which are thread-safe. Hopping here means individual handlers
+    // don't have to worry about it. Cost: one MT round-trip per op (~µs).
+    juce::var result;
+
+    struct DispatchCtx {
+        const OpHandler* handler;
+        const juce::var* args;
+        juce::String*    errorOut;
+        juce::var*       result;
+    };
+    DispatchCtx ctx { &it->second, &args, &errorOut, &result };
+
+    juce::MessageManager::getInstance()->callFunctionOnMessageThread(
+        [](void* p) -> void* {
+            auto& c = *static_cast<DispatchCtx*>(p);
+            *c.result = (*c.handler)(*c.args, *c.errorOut);
+            return nullptr;
+        },
+        &ctx);
 
     if (errorOut.isNotEmpty())
     {
@@ -220,7 +243,8 @@ void ControlServer::dispatchRequest(const juce::var& request, juce::String& resp
 
 void ControlServer::sendEvent(const juce::String& evt, const juce::DynamicObject::Ptr& payload)
 {
-    juce::DynamicObject::Ptr env { payload != nullptr ? payload : new juce::DynamicObject() };
+    juce::DynamicObject::Ptr env = payload;
+    if (env == nullptr) env = new juce::DynamicObject();
     env->setProperty("evt", evt);
 
     const juce::String body = juce::JSON::toString(juce::var(env.get()), true);

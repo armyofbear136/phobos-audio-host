@@ -8,8 +8,10 @@ namespace phobos {
 
 namespace {
 
-// OSC strings are zero-padded to 4-byte alignment.
-inline int oscPaddedLen(int len) noexcept { return (len + 4) & ~3; }
+// Round a raw-byte length (string content + 1 null) up to the next 4-byte
+// boundary. When already aligned, no extra padding is added — matches the
+// OSC 1.0 spec ("the total number of bytes is a multiple of 4").
+inline int oscPaddedLen(int len) noexcept { return (len + 3) & ~3; }
 
 // Read a length-prefixed OSC string from buf. Returns the cursor after the
 // string + padding, or -1 on malformed input. Sets out to point at the

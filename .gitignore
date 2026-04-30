@@ -1,5 +1,6 @@
 # JUCE — vendored as a sibling clone, not committed.
 JUCE/
+JUCE.*
 
 # CMake / build outputs
 build/
