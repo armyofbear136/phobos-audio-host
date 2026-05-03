@@ -70,6 +70,13 @@ private:
     // Active connection. Owned by the connection thread; the acceptor
     // hands ownership over and only retains a non-owning pointer for
     // sendEvent. Guarded by connMutex.
+    //
+    // connMutex also serializes ALL socket writes against the active
+    // connection. The response path (runConnectionLoop) and the event
+    // path (sendEvent / forwardLog) both write [length-prefix][body]
+    // pairs; without serialization they interleave and smash one frame's
+    // header into another frame's body on the wire. One mutex, one
+    // invariant: "exclusive use of the active connection right now."
     juce::CriticalSection            connMutex;
     juce::StreamingSocket*           activeConn = nullptr;
 

@@ -135,7 +135,18 @@ void ControlServer::runConnectionLoop(std::unique_ptr<juce::StreamingSocket> con
         juce::String responseJson;
         dispatchRequest(request, responseJson);
 
-        if (! writeFrame(*conn, responseJson)) break;
+        // Serialize against any concurrent sendEvent on the same socket.
+        // Without this, a [length][body] write here can be sliced apart
+        // by a sendEvent's own [length][body] write, mashing two frames
+        // together on the wire. connMutex covers both connection-pointer
+        // identity and exclusive write access — one lock, one invariant:
+        // "I have exclusive use of the active connection right now."
+        bool ok;
+        {
+            const juce::ScopedLock lock(connMutex);
+            ok = writeFrame(*conn, responseJson);
+        }
+        if (! ok) break;
     }
 
     {

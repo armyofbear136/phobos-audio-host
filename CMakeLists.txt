@@ -38,7 +38,9 @@ target_include_directories(PhobosHost PRIVATE
 )
 
 target_link_libraries(PhobosHost PRIVATE
+    juce::juce_audio_basics
     juce::juce_audio_devices
+    juce::juce_audio_formats
     juce::juce_audio_processors
     juce::juce_audio_utils
     juce::juce_core

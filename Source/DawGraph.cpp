@@ -11,8 +11,13 @@ constexpr int kStereoChannels = 2;
 
 } // namespace
 
-DawGraph::DawGraph() = default;
-DawGraph::~DawGraph() = default;
+DawGraph::DawGraph()  { audioFormats.registerBasicFormats(); }
+DawGraph::~DawGraph()
+{
+    // Stop the reader thread before any file-player nodes destruct so the
+    // background prefetch is joined cleanly.
+    if (readerThread != nullptr) readerThread->stopThread(2000);
+}
 
 void DawGraph::initialize(juce::AudioPluginFormatManager& fmts,
                           double sr, int bs)
@@ -30,6 +35,24 @@ void DawGraph::initialize(juce::AudioPluginFormatManager& fmts,
 
     midiInputNodeId   = midiIn  ->nodeID;
     audioOutputNodeId = audioOut->nodeID;
+
+    // SchedulerNode is a permanent MIDI-producing node. Its MIDI output is
+    // wired into every per-channel MidiChannelFilter alongside midiInputNode
+    // by rewireChannel — when a channel is created (instrument loaded), the
+    // scheduler joins as a sibling MIDI source for that channel.
+    auto schedulerOwned = std::make_unique<SchedulerNode>();
+    scheduler = schedulerOwned.get();
+    auto schedulerNode = graph.addNode(std::move(schedulerOwned));
+    schedulerNodeId = schedulerNode->nodeID;
+
+    // AudioSumNode is the channel-0 mix point. Permanent — instrument and
+    // any number of file players (and future game-audio sources) sum into
+    // it before flowing through the channel-0 FX chain (Crystal). JUCE adds
+    // multiple incoming connections automatically; the sum node itself is a
+    // passthrough that exists purely as a named topology anchor.
+    auto sumOwned = std::make_unique<AudioSumNode>();
+    auto sumNode = graph.addNode(std::move(sumOwned));
+    audioSumNodeId = sumNode->nodeID;
 }
 
 DawGraph::ChannelChain& DawGraph::chainFor(int channelIdx)
@@ -126,6 +149,18 @@ juce::AudioProcessor* DawGraph::getProcessorForSlot(int slotId)
     return node != nullptr ? node->getProcessor() : nullptr;
 }
 
+int DawGraph::getChannelForSlot(int slotId) const noexcept
+{
+    const auto it = slots.find(slotId);
+    return it == slots.end() ? -1 : it->second.channelIdx;
+}
+
+int DawGraph::getKindForSlot(int slotId) const noexcept
+{
+    const auto it = slots.find(slotId);
+    return it == slots.end() ? -1 : static_cast<int>(it->second.kind);
+}
+
 void DawGraph::rewireChannel(int channelIdx)
 {
     auto chainIt = channels.find(channelIdx);
@@ -134,7 +169,7 @@ void DawGraph::rewireChannel(int channelIdx)
 
     // Collect every nodeId that participates in this channel.
     std::vector<juce::AudioProcessorGraph::NodeID> nodesInChannel;
-    nodesInChannel.reserve(2 + chain.fxSlots.size());
+    nodesInChannel.reserve(4 + chain.fxSlots.size() + filePlayers.size());
 
     if (chain.midiFilterNode.uid != 0)
         nodesInChannel.push_back(chain.midiFilterNode);
@@ -151,6 +186,18 @@ void DawGraph::rewireChannel(int channelIdx)
         if (sit != slots.end()) nodesInChannel.push_back(sit->second.nodeId);
     }
 
+    // Channel 0 also owns the audioSumNode and every active file player.
+    // Pull those into the per-channel cleanup so old connections to/from the
+    // sum node get refreshed when this channel rewires.
+    const bool isChannelZero = (channelIdx == 0);
+    if (isChannelZero)
+    {
+        if (audioSumNodeId.uid != 0)
+            nodesInChannel.push_back(audioSumNodeId);
+        for (const auto& kv : filePlayers)
+            nodesInChannel.push_back(kv.second.nodeId);
+    }
+
     // Drop every existing connection touching any of those nodes.
     for (const auto& cn : graph.getConnections())
     {
@@ -164,32 +211,83 @@ void DawGraph::rewireChannel(int channelIdx)
         }
     }
 
+    // ── MIDI wiring ──────────────────────────────────────────────────────────
+    //
     // No instrument → channel is silent. Filter (if any) stays in the graph
-    // but disconnected; that's fine.
-    if (chain.instrumentSlot < 0) return;
-
-    const auto instSlotIt = slots.find(chain.instrumentSlot);
-    if (instSlotIt == slots.end()) return;
-    const auto instNodeId = instSlotIt->second.nodeId;
-
-    // MIDI: midiInput → filter → instrument
-    if (chain.midiFilterNode.uid != 0)
+    // but disconnected; that's fine. Note: on channel 0, we still wire the
+    // file-player sources into the sum node below even with no instrument,
+    // so audio playback works without an instrument loaded. (Today the synth
+    // is always mounted, but the graph topology shouldn't depend on that.)
+    juce::AudioProcessorGraph::NodeID instNodeId {};
+    const bool hasInstrument = (chain.instrumentSlot >= 0);
+    if (hasInstrument)
     {
-        graph.addConnection({{ midiInputNodeId,         juce::AudioProcessorGraph::midiChannelIndex },
-                             { chain.midiFilterNode,   juce::AudioProcessorGraph::midiChannelIndex }});
-        graph.addConnection({{ chain.midiFilterNode,   juce::AudioProcessorGraph::midiChannelIndex },
-                             { instNodeId,             juce::AudioProcessorGraph::midiChannelIndex }});
+        const auto instSlotIt = slots.find(chain.instrumentSlot);
+        if (instSlotIt == slots.end()) return;
+        instNodeId = instSlotIt->second.nodeId;
+
+        // MIDI: midiInput → filter → instrument; SchedulerNode also feeds into
+        // the same filter so sequence events merge with OSC events on the per-
+        // channel filter input. JUCE's graph adds MIDI from multiple sources,
+        // so the merge is automatic.
+        if (chain.midiFilterNode.uid != 0)
+        {
+            graph.addConnection({{ midiInputNodeId,         juce::AudioProcessorGraph::midiChannelIndex },
+                                 { chain.midiFilterNode,   juce::AudioProcessorGraph::midiChannelIndex }});
+            if (schedulerNodeId.uid != 0)
+                graph.addConnection({{ schedulerNodeId,    juce::AudioProcessorGraph::midiChannelIndex },
+                                     { chain.midiFilterNode, juce::AudioProcessorGraph::midiChannelIndex }});
+            graph.addConnection({{ chain.midiFilterNode,   juce::AudioProcessorGraph::midiChannelIndex },
+                                 { instNodeId,             juce::AudioProcessorGraph::midiChannelIndex }});
+        }
+        else
+        {
+            // No filter — wire MIDI directly. (Shouldn't happen in normal flow,
+            // since loadPlugin(instrument) creates the filter, but be safe.)
+            graph.addConnection({{ midiInputNodeId, juce::AudioProcessorGraph::midiChannelIndex },
+                                 { instNodeId,     juce::AudioProcessorGraph::midiChannelIndex }});
+            if (schedulerNodeId.uid != 0)
+                graph.addConnection({{ schedulerNodeId, juce::AudioProcessorGraph::midiChannelIndex },
+                                     { instNodeId,     juce::AudioProcessorGraph::midiChannelIndex }});
+        }
+    }
+
+    // ── Audio wiring ─────────────────────────────────────────────────────────
+    //
+    // Channel 0:  (instrument + every file player) → audioSumNode → fx → out.
+    // Others:     instrument → fx → out  (no sum node).
+    //
+    // The sum node is permanent on channel 0 and wired even when no
+    // instrument is loaded — file players still need a path to the FX chain.
+    // If neither an instrument nor any file players exist on channel 0, the
+    // sum node has no upstream connections; it sits dormant.
+
+    juce::AudioProcessorGraph::NodeID audioSourceTail {};
+
+    if (isChannelZero && audioSumNodeId.uid != 0)
+    {
+        // Wire all upstream sources into the sum node.
+        if (hasInstrument)
+        {
+            for (int ch = 0; ch < kStereoChannels; ++ch)
+                graph.addConnection({{ instNodeId,    ch }, { audioSumNodeId, ch }});
+        }
+        for (const auto& kv : filePlayers)
+        {
+            for (int ch = 0; ch < kStereoChannels; ++ch)
+                graph.addConnection({{ kv.second.nodeId, ch }, { audioSumNodeId, ch }});
+        }
+        audioSourceTail = audioSumNodeId;
     }
     else
     {
-        // No filter — wire MIDI directly. (Shouldn't happen in normal flow,
-        // since loadPlugin(instrument) creates the filter, but be safe.)
-        graph.addConnection({{ midiInputNodeId, juce::AudioProcessorGraph::midiChannelIndex },
-                             { instNodeId,     juce::AudioProcessorGraph::midiChannelIndex }});
+        // Non-zero channel: silent if no instrument.
+        if (! hasInstrument) return;
+        audioSourceTail = instNodeId;
     }
 
-    // Audio: instrument → fx[0] → fx[1] → ... → audioOutput
-    auto prevNodeId = instNodeId;
+    // Audio: tail → fx[0] → fx[1] → ... → audioOutput
+    auto prevNodeId = audioSourceTail;
     for (int fxSlot : chain.fxSlots)
     {
         const auto fxIt = slots.find(fxSlot);
@@ -394,6 +492,145 @@ juce::String DawGraph::setPluginState(int slotId, const void* data, int size)
         return "node missing for slot " + juce::String(slotId);
 
     node->getProcessor()->setStateInformation(data, size);
+    return {};
+}
+
+// ── File-player ops ─────────────────────────────────────────────────────────
+
+void DawGraph::ensureReaderThreadStarted()
+{
+    if (readerThread != nullptr) return;
+    readerThread = std::make_unique<juce::TimeSliceThread>("PhobosHost-AudioReader");
+    readerThread->startThread();
+}
+
+DawGraph::PlayFileResult DawGraph::playAudioFile(const juce::String& filePath,
+                                                  double startMs,
+                                                  bool   loop)
+{
+    PlayFileResult r;
+
+    juce::File file(filePath);
+    if (! file.existsAsFile())
+    {
+        r.error = "file not found: " + filePath;
+        return r;
+    }
+
+    // Reader is owned by the AudioFormatReaderSource (which owns by the
+    // FilePlayerNode's transport). createReaderFor returns nullptr if the
+    // format isn't recognised — covers WAV/AIFF/FLAC/OGG/MP3 via
+    // registerBasicFormats() in the constructor.
+    juce::AudioFormatReader* reader = audioFormats.createReaderFor(file);
+    if (reader == nullptr)
+    {
+        r.error = "unsupported audio format or read error: " + filePath;
+        return r;
+    }
+
+    ensureReaderThreadStarted();
+
+    auto fpOwned  = std::make_unique<FilePlayerNode>();
+    FilePlayerNode* fpRaw = fpOwned.get();
+    auto fpNode   = graph.addNode(std::move(fpOwned));
+
+    const double lengthSec = fpRaw->setSourceFromReader(reader, readerThread.get());
+    if (lengthSec < 0.0)
+    {
+        graph.removeNode(fpNode->nodeID);
+        r.error = "failed to attach reader to file player";
+        return r;
+    }
+
+    if (startMs > 0.0) fpRaw->setPosition(startMs / 1000.0);
+    fpRaw->setLooping(loop);
+    fpRaw->start();
+
+    const int audioId = allocateAudioId();
+    FilePlayerEntry entry;
+    entry.nodeId = fpNode->nodeID;
+    entry.node   = fpRaw;
+    filePlayers[audioId] = entry;
+
+    // Re-wire channel 0 so the new file player joins the sum.
+    rewireChannel(0);
+
+    PHOBOS_LOG("playAudioFile: audioId=%d path=%s lengthSec=%.2f loop=%d",
+               audioId, filePath.toRawUTF8(), lengthSec, loop ? 1 : 0);
+
+    r.audioId     = audioId;
+    r.durationSec = lengthSec;
+    return r;
+}
+
+juce::String DawGraph::pauseAudio(int audioId)
+{
+    auto it = filePlayers.find(audioId);
+    if (it == filePlayers.end()) return "unknown audioId " + juce::String(audioId);
+    if (it->second.node != nullptr) it->second.node->stop();
+    return {};
+}
+
+juce::String DawGraph::resumeAudio(int audioId)
+{
+    auto it = filePlayers.find(audioId);
+    if (it == filePlayers.end()) return "unknown audioId " + juce::String(audioId);
+    if (it->second.node != nullptr) it->second.node->start();
+    return {};
+}
+
+juce::String DawGraph::seekAudio(int audioId, double positionMs)
+{
+    auto it = filePlayers.find(audioId);
+    if (it == filePlayers.end()) return "unknown audioId " + juce::String(audioId);
+    if (it->second.node != nullptr) it->second.node->setPosition(positionMs / 1000.0);
+    return {};
+}
+
+juce::String DawGraph::stopAudio(int audioId)
+{
+    auto it = filePlayers.find(audioId);
+    if (it == filePlayers.end()) return "unknown audioId " + juce::String(audioId);
+
+    // Remove the node. The graph drops every connection involving it
+    // (including the source connection into audioSumNode), and the unique_ptr
+    // owned by the graph destructs — which detaches the transport's reader
+    // source on the message thread (we are on MT here per the dispatcher
+    // contract).
+    graph.removeNode(it->second.nodeId);
+    filePlayers.erase(it);
+
+    rewireChannel(0);
+
+    PHOBOS_LOG("stopAudio: audioId=%d", audioId);
+    return {};
+}
+
+
+DawGraph::AudioStatus DawGraph::getAudioStatus(int audioId) const
+{
+    AudioStatus s;
+    const auto it = filePlayers.find(audioId);
+    if (it == filePlayers.end()) return s;        // exists=false
+
+    s.exists = true;
+    if (const auto* fp = it->second.node)
+    {
+        s.playing    = fp->isPlayingNow();
+        s.positionMs = fp->getCurrentPositionSec() * 1000.0;
+        s.durationMs = fp->getLengthSec()          * 1000.0;
+        s.finished   = fp->hasFinished();
+    }
+    return s;
+}
+
+juce::String DawGraph::setAudioFileVolume(int audioId, float gain)
+{
+    auto it = filePlayers.find(audioId);
+    if (it == filePlayers.end()) return "unknown audioId " + juce::String(audioId);
+    if (it->second.node != nullptr)
+        it->second.node->setGain(gain);
+    PHOBOS_LOG("setAudioFileVolume: audioId=%d gain=%.3f", audioId, (double) gain);
     return {};
 }
 
