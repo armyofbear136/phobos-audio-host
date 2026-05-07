@@ -10,6 +10,12 @@
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
 
+#if JUCE_WINDOWS
+ #include <windows.h>                              // SetConsoleOutputCP, CP_UTF8
+ #include <io.h>                                   // _setmode, _fileno
+ #include <fcntl.h>                                // _O_BINARY
+#endif
+
 #include "ControlServer.h"
 #include "DawGraph.h"
 #include "Logger.h"
@@ -177,6 +183,31 @@ private:
             res->setProperty("plugins",      arr);
             res->setProperty("scannedFiles", result.scannedFiles);
             res->setProperty("failedFiles",  result.failedFiles);
+            return juce::var(res);
+        });
+
+        // Single-file equivalent of scanVst3Path. The TS-side filesystem
+        // scanner uses this to fill in `category` and `isInstrument` for
+        // plugins whose moduleinfo.json was missing or uninformative — the
+        // JUCE deep-probe (findAllTypesForFile) is the authoritative source
+        // for those fields. Returns the same `plugins` array shape; one
+        // .vst3 may contain multiple classes (rare, but the SDK allows it),
+        // hence still an array.
+        controlServer.registerOp("scanFile",
+            [this](const juce::var& args, juce::String& errorOut) -> juce::var
+        {
+            const auto pathStr = args.getProperty("path", juce::var()).toString();
+            if (pathStr.isEmpty()) { errorOut = "missing 'path'"; return {}; }
+
+            const auto types = scanner.scanFile(juce::File(pathStr));
+
+            juce::Array<juce::var> arr;
+            for (const auto& d : types)
+                arr.add(juce::var(descToJson(d)));
+
+            auto* res = new juce::DynamicObject();
+            res->setProperty("plugins", arr);
+            res->setProperty("failed",  types.empty());
             return juce::var(res);
         });
 
@@ -607,6 +638,34 @@ private:
 
 int main(int /*argc*/, char* /*argv*/[])
 {
+   #if JUCE_WINDOWS
+    // Windows console output of UTF-8 byte streams requires TWO fixes that
+    // are easy to confuse:
+    //
+    //   1. Console code page — `SetConsoleOutputCP(CP_UTF8)` tells the
+    //      console to interpret byte sequences as UTF-8 when rendering
+    //      glyphs.
+    //
+    //   2. CRT stream mode — by default stdout/stderr are in `_O_TEXT`
+    //      mode, which on Windows causes the CRT to translate the byte
+    //      stream through the process's ANSI code page BEFORE handing it
+    //      to the console. The CRT also rewrites '\n' to "\r\n". For
+    //      UTF-8 strings the ANSI translation step corrupts every byte
+    //      whose value is >= 0x80 — concretely, a UTF-8 path like
+    //      "C:\Users\armyo" gets turned into CJK soup ("㩃啜敳獲慜浲潹")
+    //      because the bytes are reinterpreted as wide characters.
+    //      Switching to `_O_BINARY` makes the CRT pass bytes through
+    //      verbatim. Combined with the UTF-8 console code page above,
+    //      the console then receives clean UTF-8 and renders it
+    //      correctly.
+    //
+    // Both calls are idempotent and safe to issue unconditionally on
+    // Windows.
+    SetConsoleOutputCP(CP_UTF8);
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+   #endif
+
     juce::ScopedJuceInitialiser_GUI juceInit;
 
     phobos::App app;
